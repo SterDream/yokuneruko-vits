@@ -4,7 +4,7 @@ chinese_converter
 g2pk
 jamo
 espeak_phonemizer
-pyopenjtalk==0.2.0
+pyopenjtalk
 Cython
 pyworld
 librosa
