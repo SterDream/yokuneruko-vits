@@ -199,11 +199,10 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
           pqmf = PQMF(y.device)
           y_mb = pqmf.analysis(y)
           loss_subband = subband_stft_loss(hps, y_mb, torch.tanh(y_hat_mb))
+          print("y_mb:", y_mb.shape, y_mb.abs().max())
+          print("y_hat_mb:", y_hat_mb.shape, y_hat_mb.abs().max())
         else:
           loss_subband = torch.tensor(0.0)
-
-        print("y_mb:", y_mb.shape, y_mb.abs().max())
-        print("y_hat_mb:", y_hat_mb.shape, y_hat_mb.abs().max())
 
         T = min(f0_pred.size(2), f0_gt.size(2))
 
