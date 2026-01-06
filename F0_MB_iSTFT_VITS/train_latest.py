@@ -195,10 +195,10 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
         loss_fm = feature_loss(fmap_r, fmap_g)
         loss_gen, losses_gen = generator_loss(y_d_hat_g)
         
-        if hps.model.mb_istft_vits == True:
+        if (hps.model.mb_istft_vits == True) and (global_step > hps.train.subband_start_step):
           pqmf = PQMF(y.device)
           y_mb = pqmf.analysis(y)
-          loss_subband = subband_stft_loss(hps, y_mb, y_hat_mb)
+          loss_subband = subband_stft_loss(hps, y_mb, torch.tanh(y_hat_mb))
         else:
           loss_subband = torch.tensor(0.0)
 
