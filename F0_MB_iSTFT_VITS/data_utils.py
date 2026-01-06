@@ -1,10 +1,10 @@
 import os
 import random
-import numpy as np
 import torch
 import torch.utils.data
 import pyworld as pw
 
+import utils
 import commons 
 from mel_processing import spectrogram_torch
 from utils import load_wav_to_torch, load_filepaths_and_text
@@ -39,13 +39,24 @@ class TextAudioLoader(torch.utils.data.Dataset):
     def __getitem__(self, index):
         return self.get_audio_text_pair(self.audiopaths_and_text[index])
 
-    def extract_f0(self, wav, sr):
-        f0, t = pw.dio(wav.astype(np.float64), sr)
-        f0 = pw.stonemask(wav.astype(np.float64), f0, t, sr)
-        return f0  # [T]
+    def extract_f0(self, wav, sr, hop_length):
+        wav = wav.squeeze()          # [T]
+        wav = wav.detach().cpu().numpy()
+        wav = wav.astype("float64")
+        f0, t = pw.dio(
+            wav,
+            fs=sr,
+            frame_period=1000 * hop_length / sr
+        )
+        f0 = pw.stonemask(wav, f0, t, sr)
+        return torch.from_numpy(f0).float()
 
     def get_f0(self, wav):
-        f0 = self.extract_f0(wav, self.sampling_rate, self.hop_length)
+        f0 = self.extract_f0(
+            wav,
+            self.sampling_rate,
+            self.hop_length
+        )
         return torch.FloatTensor(f0)
 
     def _filter(self):
@@ -56,6 +67,7 @@ class TextAudioLoader(torch.utils.data.Dataset):
         # wav_length ~= file_size / (wav_channels * Bytes per dim) = file_size / (1 * 2)
         # spec_length = wav_length // hop_length
 
+        hps = utils.get_hparams()
         audiopaths_and_text_new = []
         lengths = []
 
@@ -63,6 +75,10 @@ class TextAudioLoader(torch.utils.data.Dataset):
             if self.min_text_len <= len(text) and len(text) <= self.max_text_len:
                 audiopaths_and_text_new.append([audiopath, text])
                 lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
+
+            wav_len = os.path.getsize(audiopath) // 2  # int16
+            if wav_len < hps.train.segment_size:
+                continue
 
         self.audiopaths_and_text = audiopaths_and_text_new
         self.lengths = lengths
@@ -124,13 +140,13 @@ class TextAudioCollate():
         """
         # Right zero-pad all one-hot text sequences to max input length
         _, ids_sorted_decreasing = torch.sort(
-            torch.LongTensor([x[1].size(1) for x in batch]),
+            torch.LongTensor([x[1].size(-1) for x in batch]),
             dim=0, descending=True
         )
 
         max_text_len = max([len(x[0]) for x in batch])
-        max_spec_len = max([x[1].size(1) for x in batch])
-        max_wav_len = max([x[2].size(1) for x in batch])
+        max_spec_len = max([x[1].size(-1) for x in batch])
+        max_wav_len = max([x[2].size(-1) for x in batch])
 
         text_lengths = torch.LongTensor(len(batch))
         spec_lengths = torch.LongTensor(len(batch))
@@ -157,19 +173,19 @@ class TextAudioCollate():
             text_lengths[i] = text.size(0)
 
             spec = row[1]
-            spec_padded[i, :, :spec.size(1)] = spec
-            spec_lengths[i] = spec.size(1)
+            spec_padded[i, :, :spec.size(-1)] = spec
+            spec_lengths[i] = spec.size(-1)
 
             wav = row[2]
-            wav_padded[i, :, :wav.size(1)] = wav
-            wav_lengths[i] = wav.size(1)
+            wav_padded[i, :, :wav.size(-1)] = wav
+            wav_lengths[i] = wav.size(-1)
 
             f0_padded[i, :, :f0.size(-1)] = f0
-            f0_lengths[i] = f0.size(1)
+            f0_lengths[i] = f0.size(-1)
 
         if self.return_ids:
-            return text_padded, text_lengths, spec_padded, spec_lengths, wav_padded, wav_lengths, ids_sorted_decreasing, f0_padded, f0_lengths 
-        return text_padded, text_lengths, spec_padded, spec_lengths, wav_padded, wav_lengths, f0_padded, f0_lengths
+            return text_padded, text_lengths, spec_padded, spec_lengths, wav_padded, wav_lengths, ids_sorted_decreasing, f0_padded#, f0_lengths 
+        return text_padded, text_lengths, spec_padded, spec_lengths, wav_padded, wav_lengths, f0_padded#, f0_lengths
 
 
 """Multi speaker version"""
@@ -206,6 +222,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         # wav_length ~= file_size / (wav_channels * Bytes per dim) = file_size / (1 * 2)
         # spec_length = wav_length // hop_length
 
+        hps = utils.get_hparams()
         audiopaths_sid_text_new = []
         lengths = []
 
@@ -213,6 +230,10 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             if self.min_text_len <= len(text) and len(text) <= self.max_text_len:
                 audiopaths_sid_text_new.append([audiopath, sid, text])
                 lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
+
+            wav_len = os.path.getsize(audiopath) // 2  # int16
+            if wav_len < hps.train.segment_size:
+                continue
 
         self.audiopaths_sid_text = audiopaths_sid_text_new
         self.lengths = lengths
@@ -277,13 +298,13 @@ class TextAudioSpeakerCollate():
         """
         # Right zero-pad all one-hot text sequences to max input length
         _, ids_sorted_decreasing = torch.sort(
-            torch.LongTensor([x[1].size(1) for x in batch]),
+            torch.LongTensor([x[1].size(-1) for x in batch]),
             dim=0, descending=True
         )
 
         max_text_len = max([len(x[0]) for x in batch])
-        max_spec_len = max([x[1].size(1) for x in batch])
-        max_wav_len = max([x[2].size(1) for x in batch])
+        max_spec_len = max([x[1].size(-1) for x in batch])
+        max_wav_len = max([x[2].size(-1) for x in batch])
 
         text_lengths = torch.LongTensor(len(batch))
         spec_lengths = torch.LongTensor(len(batch))
@@ -305,12 +326,12 @@ class TextAudioSpeakerCollate():
             text_lengths[i] = text.size(0)
 
             spec = row[1]
-            spec_padded[i, :, :spec.size(1)] = spec
-            spec_lengths[i] = spec.size(1)
+            spec_padded[i, :, :spec.size(-1)] = spec
+            spec_lengths[i] = spec.size(-1)
 
             wav = row[2]
-            wav_padded[i, :, :wav.size(1)] = wav
-            wav_lengths[i] = wav.size(1)
+            wav_padded[i, :, :wav.size(-1)] = wav
+            wav_lengths[i] = wav.size(-1)
 
             sid[i] = row[3]
 
