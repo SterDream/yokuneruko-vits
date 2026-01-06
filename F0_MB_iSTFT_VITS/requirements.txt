@@ -5,10 +5,12 @@ g2pk
 jamo
 espeak_phonemizer
 pyopenjtalk
+unidic-lite
 Cython
 pyworld
 librosa
-matplotlib==3.9.0
+matplotlib
+matplotlib-inline
 numpy
 phonemizer
 scipy==1.10.0
