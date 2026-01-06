@@ -1,5 +1,7 @@
 import math
+import numpy as np
 import torch
+from torch import nn
 from torch.nn import functional as F
 
 
@@ -41,8 +43,23 @@ def rand_gumbel(shape):
 def rand_gumbel_like(x):
   g = rand_gumbel(x.size()).to(dtype=x.dtype, device=x.device)
   return g
+"""
 
+def slice_segments(x, ids_str, segment_size=4):
+  ret = torch.zeros_like(x[:, :, :segment_size])
+  for i in range(x.size(0)):
+    try:
+      idx_str = ids_str[i]
+      idx_end = idx_str + segment_size
+      ret[i] = x[i, :, idx_str:idx_end]
+    except:
+      idx_str = ids_str[i]
+      idx_end = idx_str + segment_size
+      ret[i] =  torch.cat((x[i, :, idx_str:] , torch.zeros), dim=１)
+      
+  return ret
 
+"""
 def slice_segments(x, ids_str, segment_size=4):
   ret = torch.zeros_like(x[:, :, :segment_size])
   for i in range(x.size(0)):
@@ -56,26 +73,35 @@ def rand_slice_segments(x, x_lengths=None, segment_size=4):
   b, d, t = x.size()
   if x_lengths is None:
     x_lengths = t
-  ids_str_max = x_lengths - segment_size + 1
+  ids_str_max = torch.floor((x_lengths - segment_size + 1))
+  #ids_str_max = torch.floor((x_lengths - segment_size + 1) * 0.7)
   ids_str = (torch.rand([b]).to(device=x.device) * ids_str_max).to(dtype=torch.long)
   ret = slice_segments(x, ids_str, segment_size)
   return ret, ids_str
 
 
-def get_timing_signal_1d(length, channels, min_timescale=1.0, max_timescale=1.0e4):
+def last_slice_segments(x, x_lengths=None, segment_size=4):
+  b, d, t = x.size()
+  if x_lengths is None:
+    x_lengths = t
+  ids_str_max = torch.floor((x_lengths - segment_size + 1))
+  #ids_str_max = torch.floor((x_lengths - segment_size + 1) * 0.7)
+  ids_str = ids_str_max - 1
+  ret = slice_segments(x, ids_str, segment_size)
+  return ret, ids_str
+
+
+
+def get_timing_signal_1d(
+    length, channels, min_timescale=1.0, max_timescale=1.0e4):
   position = torch.arange(length, dtype=torch.float)
   num_timescales = channels // 2
-
   log_timescale_increment = (
-    math.log(float(max_timescale) / float(min_timescale)) /
-    (num_timescales - 1)
-  )
+      math.log(float(max_timescale) / float(min_timescale)) /
+      (num_timescales - 1))
   inv_timescales = min_timescale * torch.exp(
-    torch.arange(num_timescales, dtype=torch.float) * -log_timescale_increment
-  )
-
+      torch.arange(num_timescales, dtype=torch.float) * -log_timescale_increment)
   scaled_time = position.unsqueeze(0) * inv_timescales.unsqueeze(1)
-
   signal = torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], 0)
   signal = F.pad(signal, [0, 0, 0, channels % 2])
   signal = signal.view(1, channels, length)
@@ -132,7 +158,7 @@ def generate_path(duration, mask):
   duration: [b, 1, t_x]
   mask: [b, 1, t_y, t_x]
   """
-  # device = duration.device
+  device = duration.device
   
   b, _, t_y, t_x = mask.shape
   cum_duration = torch.cumsum(duration, -1)
@@ -148,20 +174,16 @@ def generate_path(duration, mask):
 def clip_grad_value_(parameters, clip_value, norm_type=2):
   if isinstance(parameters, torch.Tensor):
     parameters = [parameters]
-
   parameters = list(filter(lambda p: p.grad is not None, parameters))
   norm_type = float(norm_type)
-
   if clip_value is not None:
     clip_value = float(clip_value)
 
   total_norm = 0
-
   for p in parameters:
     param_norm = p.grad.data.norm(norm_type)
     total_norm += param_norm.item() ** norm_type
     if clip_value is not None:
       p.grad.data.clamp_(min=-clip_value, max=clip_value)
-      
   total_norm = total_norm ** (1. / norm_type)
   return total_norm
