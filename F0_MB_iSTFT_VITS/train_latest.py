@@ -119,6 +119,12 @@ def run(rank, n_gpus, hps):
     scheduler_d.step()
 
 
+def check_nan(name, x):
+    if torch.isnan(x).any() or torch.isinf(x).any():
+        print(f"[NaN DETECTED] {name}")
+        return True
+    return False
+
 
 def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers):
   net_g, net_d = nets
@@ -200,6 +206,14 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
 
         loss_f0 = F.l1_loss(f0_pred[:, :, :T] * z_mask[:, :, :T], f0_gt[:, :, :T] * z_mask[:, :, :T]) * hps.train.c_f0
         loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl + loss_subband + loss_f0
+        
+        check_nan("loss_gen", loss_gen)
+        check_nan("loss_fm", loss_fm)
+        check_nan("loss_mel", loss_mel)
+        check_nan("loss_dur", loss_dur)
+        check_nan("loss_kl", loss_kl)
+        check_nan("loss_subband", loss_subband)
+        check_nan("loss_f0", loss_f0)
 
     optim_g.zero_grad()
     scaler.scale(loss_gen_all).backward()
