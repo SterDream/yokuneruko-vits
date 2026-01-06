@@ -202,6 +202,9 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
         else:
           loss_subband = torch.tensor(0.0)
 
+        print("y_mb:", y_mb.shape, y_mb.abs().max())
+        print("y_hat_mb:", y_hat_mb.shape, y_hat_mb.abs().max())
+
         T = min(f0_pred.size(2), f0_gt.size(2))
 
         loss_f0 = F.l1_loss(f0_pred[:, :, :T] * z_mask[:, :, :T], f0_gt[:, :, :T] * z_mask[:, :, :T]) * hps.train.c_f0
