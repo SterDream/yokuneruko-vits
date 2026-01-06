@@ -144,6 +144,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
     with autocast(enabled=hps.train.fp16_run):
       y_hat, y_hat_mb, l_length, attn, ids_slice, x_mask, z_mask,\
       (z, z_p, m_p, logs_p, m_q, logs_q), f0_pred = net_g(x, x_lengths, spec, spec_lengths)
+      f0_pred = torch.nan_to_num(f0_pred, nan=0.0, posinf=0.0, neginf=0.0)
 
       mel = spec_to_mel_torch(
           spec, 
@@ -195,11 +196,9 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
         else:
           loss_subband = torch.tensor(0.0)
 
-        T = z_mask.size(2)
-        f0_pred = f0_pred[:, :, :T]
-        f0_gt   = f0_gt[:, :, :T]
+        T = min(f0_pred.size(2), f0_gt.size(2))
 
-        loss_f0 = F.l1_loss(f0_pred * z_mask, f0_gt * z_mask) * hps.train.c_f0
+        loss_f0 = F.l1_loss(f0_pred[:, :, :T] * z_mask[:, :, :T], f0_gt[:, :, :T] * z_mask[:, :, :T]) * hps.train.c_f0
         loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl + loss_subband + loss_f0
 
     optim_g.zero_grad()
