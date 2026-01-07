@@ -35,7 +35,6 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 global_step = 0
-pqmf_ = PQMF()
 
 
 def main():
@@ -207,7 +206,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
         loss_gen, losses_gen = generator_loss(y_d_hat_g)
         
         if hps.model.mb_istft_vits == True:
-          pqmf = pqmf_(y.device)
+          pqmf = PQMF(y.device)
           y_mb = pqmf.analysis(y)
           loss_subband = subband_stft_loss(hps, y_mb, y_hat_mb)
         else:
