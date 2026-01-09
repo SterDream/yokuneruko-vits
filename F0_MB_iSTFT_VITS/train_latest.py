@@ -172,6 +172,9 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
       (z, z_p, m_p, logs_p, m_q, logs_q), f0_pred = net_g(x, x_lengths, spec, spec_lengths)
       f0_pred = torch.nan_to_num(f0_pred, nan=0.0, posinf=0.0, neginf=0.0)
 
+      logs_p = torch.clamp(logs_p, min=-10.0, max=10.0)
+      logs_q = torch.clamp(logs_q, min=-10.0, max=10.0)
+
       mel = spec_to_mel_torch(
           spec, 
           hps.data.filter_length, 
@@ -229,7 +232,6 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
           loss_subband = torch.zeros_like(loss_mel)
 
         T = min(f0_pred.size(2), f0_gt.size(2))
-
         loss_f0 = F.l1_loss(f0_pred[:, :, :T] * z_mask[:, :, :T], f0_gt[:, :, :T] * z_mask[:, :, :T]) * hps.train.c_f0
         loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl + loss_subband + loss_f0
 
