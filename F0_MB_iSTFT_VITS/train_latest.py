@@ -6,7 +6,6 @@ from torch.utils.tensorboard import SummaryWriter
 import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import autocast, GradScaler
 from pqmf import PQMF
 
 import commons
@@ -32,7 +31,6 @@ from text.symbols import symbols
 
 torch.autograd.set_detect_anomaly(True)
 torch.backends.cudnn.benchmark = True
-torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 global_step = 0
 
@@ -62,6 +60,8 @@ def run(rank, n_gpus, hps):
   dist.init_process_group(backend='nccl', init_method='env://', world_size=n_gpus, rank=rank)
   torch.manual_seed(hps.train.seed)
   torch.cuda.set_device(rank)
+
+  pqmf = PQMF(subbands=hps.model.subbands)
 
   train_dataset = TextAudioLoader(hps.data.training_files, hps.data)
   train_sampler = DistributedBucketSampler(
@@ -122,19 +122,19 @@ def run(rank, n_gpus, hps):
   scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=hps.train.lr_decay, last_epoch=epoch_str-2)
   scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=hps.train.lr_decay, last_epoch=epoch_str-2)
 
-  scaler = GradScaler(enabled=hps.train.fp16_run)
+  scaler = torch.amp.GradScaler(enabled=hps.train.fp16_run)
 
   for epoch in range(epoch_str, hps.train.epochs + 1):
     if rank==0:
-      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, eval_loader], logger, [writer, writer_eval])
+      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, eval_loader], logger, [writer, writer_eval], pqmf)
     else:
-      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, None], None, None)
+      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, None], None, None, pqmf)
     scheduler_g.step()
     scheduler_d.step()
 
 
 
-def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers):
+def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers, pqmf):
   net_g, net_d = nets
   optim_g, optim_d = optims
   scheduler_g, scheduler_d = schedulers
@@ -155,7 +155,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
     spec, spec_lengths = spec.cuda(rank, non_blocking=True), spec_lengths.cuda(rank, non_blocking=True)
     y, y_lengths = y.cuda(rank, non_blocking=True), y_lengths.cuda(rank, non_blocking=True)
 
-    with autocast(enabled=hps.train.fp16_run):
+    with torch.amp.autocast(enabled=hps.train.fp16_run):
       y_hat, y_hat_mb, l_length, attn, ids_slice, x_mask, z_mask,\
       (z, z_p, m_p, logs_p, m_q, logs_q), f0_pred = net_g(x, x_lengths, spec, spec_lengths)
       f0_pred = torch.nan_to_num(f0_pred, nan=0.0, posinf=0.0, neginf=0.0)
@@ -183,7 +183,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
 
       # Discriminator
       y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
-      with autocast(enabled=False):
+      with torch.amp.autocast(enabled=False):
         loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(y_d_hat_r, y_d_hat_g)
         loss_disc_all = loss_disc
     optim_d.zero_grad()
@@ -192,10 +192,10 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
     grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
     scaler.step(optim_d)
 
-    with autocast(enabled=hps.train.fp16_run):
+    with torch.amp.autocast(enabled=hps.train.fp16_run):
       # Generator
       y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
-      with autocast(enabled=False):
+      with torch.amp.autocast(enabled=False):
         loss_dur = torch.sum(l_length.float())
         loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
         loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
@@ -203,12 +203,14 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
         loss_fm = feature_loss(fmap_r, fmap_g)
         loss_gen, losses_gen = generator_loss(y_d_hat_g)
         
-        if hps.model.mb_istft_vits == True:
-          pqmf = PQMF(y.device)
-          y_mb = pqmf.analysis(y)
-          loss_subband = subband_stft_loss(hps, y_mb, y_hat_mb)
+        if global_step % hps.train.subband_interval == 0:
+          if hps.model.mb_istft_vits == True:
+            y_mb = pqmf.analysis(y)
+            loss_subband = subband_stft_loss(hps, y_mb, y_hat_mb)
+          else:
+            loss_subband = torch.tensor(0.0)
         else:
-          loss_subband = torch.tensor(0.0)
+          loss_subband = torch.zeros_like(loss_mel)
 
         T = min(f0_pred.size(2), f0_gt.size(2))
 
