@@ -19,6 +19,7 @@
     "hop_sizes": [30, 60, 10],
     "win_lengths": [150, 300, 60],
     "window": "hann_window",
+    "subband_interval": 5,
     "c_f0": 0.1  
   },
   "data": {
