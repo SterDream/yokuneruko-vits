@@ -167,7 +167,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
     spec, spec_lengths = spec.cuda(rank, non_blocking=True), spec_lengths.cuda(rank, non_blocking=True)
     y, y_lengths = y.cuda(rank, non_blocking=True), y_lengths.cuda(rank, non_blocking=True)
 
-    with torch.amp.autocast(enabled=hps.train.fp16_run):
+    with torch.amp.autocast("cuda", enabled=hps.train.fp16_run):
       y_hat, y_hat_mb, l_length, attn, ids_slice, x_mask, z_mask,\
       (z, z_p, m_p, logs_p, m_q, logs_q), f0_pred = net_g(x, x_lengths, spec, spec_lengths)
       f0_pred = torch.nan_to_num(f0_pred, nan=0.0, posinf=0.0, neginf=0.0)
@@ -196,7 +196,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
       # Discriminator
       y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
 
-      with torch.amp.autocast(enabled=False):
+      with torch.amp.autocast("cuda", enabled=False):
         loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(y_d_hat_r, y_d_hat_g)
         loss_disc_all = loss_disc
 
@@ -206,12 +206,13 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
     grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
     scaler.step(optim_d)
 
-    with torch.amp.autocast(enabled=hps.train.fp16_run):
+    with torch.amp.autocast("cuda", enabled=hps.train.fp16_run):
       # Generator
       y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
-      with torch.amp.autocast(enabled=False):
+      with torch.amp.autocast("cuda", enabled=False):
+        T = min(y_mel.size(2), y_hat_mel.size(2))
+        loss_mel = F.l1_loss(y_mel[:, :, :T], y_hat_mel[:, :, :T]) * hps.train.c_mel
         loss_dur = torch.sum(l_length.float())
-        loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
         loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
 
         loss_fm = feature_loss(fmap_r, fmap_g)
@@ -316,7 +317,7 @@ def evaluate(hps, generator, eval_loader, writer_eval):
       )
     image_dict = {"gen/mel": utils.plot_spectrogram_to_numpy(y_hat_mel[0].cpu().numpy())}
     audio_dict = {"gen/audio": y_hat[0,:,:y_hat_lengths[0]]}
-    
+
     if global_step == 0:
       image_dict.update({"gt/mel": utils.plot_spectrogram_to_numpy(mel[0].cpu().numpy())})
       audio_dict.update({"gt/audio": y[0,:,:y_lengths[0]]})
