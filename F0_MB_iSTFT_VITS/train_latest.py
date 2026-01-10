@@ -63,12 +63,13 @@ def run(rank, n_gpus, hps):
 
   train_dataset = TextAudioLoader(hps.data.training_files, hps.data)
   train_sampler = DistributedBucketSampler(
-      train_dataset,
-      hps.train.batch_size,
-      [32,300,400,500,600,700,800,900,1000],
-      num_replicas=n_gpus,
-      rank=rank,
-      shuffle=True)
+    train_dataset,
+    hps.train.batch_size,
+    [32,300,400,500,600,700,800,900,1000],
+    num_replicas=n_gpus,
+    rank=rank,
+    shuffle=True
+  )
   collate_fn = TextAudioCollate()
   train_loader = DataLoader(
     train_dataset,
@@ -78,6 +79,7 @@ def run(rank, n_gpus, hps):
     collate_fn=collate_fn,
     batch_sampler=train_sampler
   )
+
   if rank == 0:
     eval_dataset = TextAudioLoader(hps.data.validation_files, hps.data)
     eval_loader = DataLoader(
@@ -91,24 +93,25 @@ def run(rank, n_gpus, hps):
     )
 
   net_g = SynthesizerTrn(
-      len(symbols),
-      hps.data.filter_length // 2 + 1,
-      hps.train.segment_size // hps.data.hop_length,
-      **hps.model).cuda(rank)
+    len(symbols),
+    hps.data.filter_length // 2 + 1,
+    hps.train.segment_size // hps.data.hop_length,
+    **hps.model).cuda(rank)
   net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(rank)
   optim_g = torch.optim.AdamW(
-      net_g.parameters(), 
-      hps.train.learning_rate, 
-      betas=hps.train.betas, 
-      eps=hps.train.eps)
+    net_g.parameters(), 
+    hps.train.learning_rate, 
+    betas=hps.train.betas, 
+    eps=hps.train.eps)
   optim_d = torch.optim.AdamW(
-      net_d.parameters(),
-      hps.train.learning_rate, 
-      betas=hps.train.betas, 
-      eps=hps.train.eps)
+    net_d.parameters(),
+    hps.train.learning_rate, 
+    betas=hps.train.betas, 
+    eps=hps.train.eps)
+  
   try:
-    net_g = DDP(net_g, device_ids=[rank], find_unused_parameters=True)
-    net_d = DDP(net_d, device_ids=[rank], find_unused_parameters=True)
+    net_g = utils.load_model_diffsize(os.path.join(hps.train.finetune_model_dir, "G_finetune.pth"), net_g, hps, optim_g)
+    net_d = utils.load_model_diffsize(os.path.join(hps.train.finetune_model_dir, "D_finetune.pth"), net_d, hps, optim_d)
     print("################## FineTuning Mode ##################")
     epoch_str = 1
     global_step = 0
@@ -127,7 +130,6 @@ def run(rank, n_gpus, hps):
 
   scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=hps.train.lr_decay, last_epoch=epoch_str-2)
   scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=hps.train.lr_decay, last_epoch=epoch_str-2)
-
   scaler = torch.amp.GradScaler(device="cuda", enabled=hps.train.fp16_run)
 
   net_g = DDP(net_g, device_ids=[rank]) # Linux Only
@@ -172,28 +174,26 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
       (z, z_p, m_p, logs_p, m_q, logs_q), f0_pred = net_g(x, x_lengths, spec, spec_lengths)
       f0_pred = torch.nan_to_num(f0_pred, nan=0.0, posinf=0.0, neginf=0.0)
 
-      logs_p = torch.clamp(logs_p, min=-10.0, max=10.0)
-      logs_q = torch.clamp(logs_q, min=-10.0, max=10.0)
+      # logs_p = torch.clamp(logs_p, min=-10.0, max=10.0)
+      # logs_q = torch.clamp(logs_q, min=-10.0, max=10.0)
 
       mel = spec_to_mel_torch(
-          spec, 
-          hps.data.filter_length, 
-          hps.data.n_mel_channels, 
-          hps.data.sampling_rate,
-          hps.data.mel_fmin, 
-          hps.data.mel_fmax
-      )
+        spec, 
+        hps.data.filter_length, 
+        hps.data.n_mel_channels, 
+        hps.data.sampling_rate,
+        hps.data.mel_fmin, 
+        hps.data.mel_fmax)
       y_mel = commons.slice_segments(mel, ids_slice, hps.train.segment_size // hps.data.hop_length)
       y_hat_mel = mel_spectrogram_torch(
-          y_hat.squeeze(1), 
-          hps.data.filter_length, 
-          hps.data.n_mel_channels, 
-          hps.data.sampling_rate, 
-          hps.data.hop_length, 
-          hps.data.win_length, 
-          hps.data.mel_fmin, 
-          hps.data.mel_fmax
-      )
+        y_hat.squeeze(1), 
+        hps.data.filter_length, 
+        hps.data.n_mel_channels, 
+        hps.data.sampling_rate, 
+        hps.data.hop_length, 
+        hps.data.win_length, 
+        hps.data.mel_fmin, 
+        hps.data.mel_fmax)
       y = commons.slice_segments(y, ids_slice * hps.data.hop_length, hps.train.segment_size) # slice 
 
       # Discriminator
@@ -210,11 +210,12 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
     scaler.step(optim_d)
 
     with torch.amp.autocast("cuda", enabled=hps.train.fp16_run):
-      # Generator
       y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
+
       with torch.amp.autocast("cuda", enabled=False):
         T = min(y_mel.size(2), y_hat_mel.size(2))
         loss_mel = F.l1_loss(y_mel[:, :, :T], y_hat_mel[:, :, :T]) * hps.train.c_mel
+
         loss_dur = torch.sum(l_length.float())
         loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
 
@@ -246,9 +247,8 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
       if global_step % hps.train.log_interval == 0:
         lr = optim_g.param_groups[0]['lr']
         losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl, loss_subband]
-        logger.info('Train Epoch: {} [{:.0f}%]'.format(
-          epoch,
-          100. * batch_idx / len(train_loader)))
+
+        logger.info('Train Epoch: {} [{:.0f}%]'.format(epoch, 100. * batch_idx / len(train_loader)))
         logger.info([x.item() for x in losses] + [global_step, lr])
         
         scalar_dict = {"loss/g/total": loss_gen_all, "loss/d/total": loss_disc_all, "learning_rate": lr, "grad_norm_d": grad_norm_d, "grad_norm_g": grad_norm_g}
@@ -278,7 +278,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
   
   if rank == 0:
     logger.info('====> Epoch: {}'.format(epoch))
-  
+
     
 def evaluate(hps, generator, eval_loader, writer_eval):
     generator.eval()
@@ -296,6 +296,7 @@ def evaluate(hps, generator, eval_loader, writer_eval):
         y = y[:1]
         y_lengths = y_lengths[:1]
         break
+
       y_hat, y_hat_mb, attn, mask, *_ = generator.module.infer(x, x_lengths, max_len=1000)
       y_hat_lengths = mask.sum([1,2]).long() * hps.data.hop_length
 
@@ -305,8 +306,7 @@ def evaluate(hps, generator, eval_loader, writer_eval):
         hps.data.n_mel_channels, 
         hps.data.sampling_rate,
         hps.data.mel_fmin, 
-        hps.data.mel_fmax
-      )
+        hps.data.mel_fmax)
       y_hat_mel = mel_spectrogram_torch(
         y_hat.squeeze(1).float(),
         hps.data.filter_length,
@@ -315,8 +315,8 @@ def evaluate(hps, generator, eval_loader, writer_eval):
         hps.data.hop_length,
         hps.data.win_length,
         hps.data.mel_fmin,
-        hps.data.mel_fmax
-      )
+        hps.data.mel_fmax)
+      
     image_dict = {"gen/mel": utils.plot_spectrogram_to_numpy(y_hat_mel[0].cpu().numpy())}
     audio_dict = {"gen/audio": y_hat[0,:,:y_hat_lengths[0]]}
 
@@ -329,8 +329,8 @@ def evaluate(hps, generator, eval_loader, writer_eval):
       global_step=global_step, 
       images=image_dict,
       audios=audio_dict,
-      audio_sampling_rate=hps.data.sampling_rate
-    )
+      audio_sampling_rate=hps.data.sampling_rate)
+    
     generator.train()
 
                            
