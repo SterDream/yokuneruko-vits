@@ -64,6 +64,28 @@ def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path)
   )
 
 
+def load_model_diffsize(checkpoint_path, model, hps, optimizer=None):
+    assert os.path.isfile(checkpoint_path)
+    checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')["model"]
+
+    if hasattr(model, 'module'):
+        state_dict = model.module.state_dict()
+    else:
+        state_dict = model.state_dict()
+
+    for k, v in checkpoint_dict.items():
+        if k in state_dict and state_dict[k].size() == v.size():
+            state_dict[k] = v
+        else:
+          print("Diffsize ",k)
+    
+    if hasattr(model, 'module'):
+        model.module.load_state_dict(state_dict, strict=False)
+    else:
+        model.load_state_dict(state_dict, strict=False)
+    return model
+
+
 def summarize(writer, global_step, scalars={}, histograms={}, images={}, audios={}, audio_sampling_rate=22050):
   for k, v in scalars.items():
     writer.add_scalar(k, v, global_step)
