@@ -132,8 +132,11 @@ def run(rank, n_gpus, hps):
   scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=hps.train.lr_decay, last_epoch=epoch_str-2)
   scaler = torch.amp.GradScaler(device="cuda", enabled=hps.train.fp16_run)
 
-  net_g = DDP(net_g, device_ids=[rank]) # Linux Only
-  net_d = DDP(net_d, device_ids=[rank]) # Linux Only
+  net_g = DDP(net_g, device_ids=[rank], find_unused_parameters=True) # Linux Only
+  net_d = DDP(net_d, device_ids=[rank], find_unused_parameters=True) # Linux Only
+
+  net_g = torch.compile(net_g, mode="reduce-overhead", fullgraph=False)
+  net_d = torch.compile(net_d, mode="reduce-overhead", fullgraph=False)
 
   for epoch in range(epoch_str, hps.train.epochs + 1):
     if rank==0:
@@ -222,15 +225,16 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
         loss_fm = feature_loss(fmap_r, fmap_g)
         loss_gen, losses_gen = generator_loss(y_d_hat_g)
         
-        if global_step % hps.train.subband_interval == 0:
-          if hps.model.mb_istft_vits == True:
-            pqmf = PQMF(y.device)
-            y_mb = pqmf.analysis(y)
-            loss_subband = subband_stft_loss(hps, y_mb, y_hat_mb)
+        with torch._dynamo.disable():
+          if global_step % hps.train.subband_interval == 0:
+            if hps.model.mb_istft_vits == True:
+              pqmf = PQMF(y.device)
+              y_mb = pqmf.analysis(y)
+              loss_subband = subband_stft_loss(hps, y_mb, y_hat_mb)
+            else:
+              loss_subband = torch.tensor(0.0)
           else:
-            loss_subband = torch.tensor(0.0)
-        else:
-          loss_subband = torch.zeros_like(loss_mel)
+            loss_subband = torch.zeros_like(loss_mel)
 
         T = min(f0_pred.size(2), f0_gt.size(2))
         loss_f0 = F.l1_loss(f0_pred[:, :, :T] * z_mask[:, :, :T], f0_gt[:, :, :T] * z_mask[:, :, :T]) * hps.train.c_f0
