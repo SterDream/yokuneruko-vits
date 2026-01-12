@@ -1,24 +1,22 @@
 import os
 import torch
+from torch.amp import autocast
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-import torch.multiprocessing as mp
-import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+import utils
+import commons
 from pqmf import PQMF
 
-import commons
-import utils
-from data_utils import (
-  TextAudioLoader,
-  TextAudioCollate,
-  DistributedBucketSampler
-)
-from models import (
-  SynthesizerTrn,
-  MultiPeriodDiscriminator,
-)
+from text.symbols import symbols
+from models import SynthesizerTrn, MultiPeriodDiscriminator
+from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
+from data_utils import TextAudioLoader, TextAudioCollate, DistributedBucketSampler
+
 from losses import (
   generator_loss,
   discriminator_loss,
@@ -26,8 +24,6 @@ from losses import (
   kl_loss,
   subband_stft_loss
 )
-from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
-from text.symbols import symbols
 
 torch.autograd.set_detect_anomaly(True)
 torch.backends.cudnn.benchmark = True
@@ -65,7 +61,7 @@ def run(rank, n_gpus, hps):
   train_sampler = DistributedBucketSampler(
     train_dataset,
     hps.train.batch_size,
-    [32,300,400,500,600,700,800,900,1000],
+    [32, 300, 400, 500, 600, 700, 800, 900, 1000],
     num_replicas=n_gpus,
     rank=rank,
     shuffle=True
@@ -73,20 +69,21 @@ def run(rank, n_gpus, hps):
   collate_fn = TextAudioCollate()
   train_loader = DataLoader(
     train_dataset,
-    num_workers=8,
+    num_workers=os.cpu_count(), # 8 -> os.cpu_count()
     shuffle=False,
     pin_memory=True,
     collate_fn=collate_fn,
-    batch_sampler=train_sampler
+    batch_sampler=train_sampler,
+    persistent_workers=True, # False -> True
   )
 
   if rank == 0:
     eval_dataset = TextAudioLoader(hps.data.validation_files, hps.data)
     eval_loader = DataLoader(
       eval_dataset,
-      num_workers=1,
+      num_workers=os.cpu_count(), # 1 -> os.cpu_count()
       shuffle=False,
-      batch_size=hps.train.batch_size,
+      batch_size=1, # hps.train.batch_size -> 1
       pin_memory=True,
       drop_last=False,
       collate_fn=collate_fn
@@ -108,7 +105,6 @@ def run(rank, n_gpus, hps):
     hps.train.learning_rate, 
     betas=hps.train.betas, 
     eps=hps.train.eps)
-  
   try:
     net_g = utils.load_model_diffsize(os.path.join(hps.train.finetune_model_dir, "G_finetune.pth"), net_g, hps, optim_g)
     net_d = utils.load_model_diffsize(os.path.join(hps.train.finetune_model_dir, "D_finetune.pth"), net_d, hps, optim_d)
@@ -138,6 +134,8 @@ def run(rank, n_gpus, hps):
   net_g = torch.compile(net_g, mode="reduce-overhead", fullgraph=False)
   net_d = torch.compile(net_d, mode="reduce-overhead", fullgraph=False)
 
+  torch.cuda.empty_cache()
+
   for epoch in range(epoch_str, hps.train.epochs + 1):
     if rank==0:
       train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, eval_loader], logger, [writer, writer_eval])
@@ -149,6 +147,17 @@ def run(rank, n_gpus, hps):
   utils.save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch, os.path.join(hps.model_dir, "G_{}.pth".format(global_step)))
   utils.save_checkpoint(net_d, optim_d, hps.train.learning_rate, epoch, os.path.join(hps.model_dir, "D_{}.pth".format(global_step)))
 
+
+@torch._dynamo.disable
+def compute_subband_loss(hps, y, y_hat_mb):
+    pqmf = PQMF(y.device)
+    y_mb = pqmf.analysis(y)
+    return subband_stft_loss(hps, y_mb, y_hat_mb)
+
+
+@torch._dynamo.disable
+def compute_kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
+    return kl_loss(z_p, logs_q, m_p, logs_p, z_mask)
 
 
 def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers):
@@ -172,7 +181,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
     spec, spec_lengths = spec.cuda(rank, non_blocking=True), spec_lengths.cuda(rank, non_blocking=True)
     y, y_lengths = y.cuda(rank, non_blocking=True), y_lengths.cuda(rank, non_blocking=True)
 
-    with torch.amp.autocast("cuda", enabled=hps.train.fp16_run):
+    with autocast("cuda", enabled=hps.train.fp16_run):
       y_hat, y_hat_mb, l_length, attn, ids_slice, x_mask, z_mask,\
       (z, z_p, m_p, logs_p, m_q, logs_q), f0_pred = net_g(x, x_lengths, spec, spec_lengths)
       f0_pred = torch.nan_to_num(f0_pred, nan=0.0, posinf=0.0, neginf=0.0)
@@ -202,45 +211,45 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
       # Discriminator
       y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
 
-      with torch.amp.autocast("cuda", enabled=False):
+      with autocast("cuda", enabled=False):
         loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(y_d_hat_r, y_d_hat_g)
         loss_disc_all = loss_disc
 
-    optim_d.zero_grad()
+    # optim_d.zero_grad()
+    for param in optim_d.parameters():
+      param.grad = None
+
     scaler.scale(loss_disc_all).backward()
     scaler.unscale_(optim_d)
     grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
-    scaler.step(optim_d)
+    scaler.step(optim_d)    
 
-    with torch.amp.autocast("cuda", enabled=hps.train.fp16_run):
+    with autocast("cuda", enabled=hps.train.fp16_run):
       y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
 
-      with torch.amp.autocast("cuda", enabled=False):
+      with autocast("cuda", enabled=False):
         T = min(y_mel.size(2), y_hat_mel.size(2))
         loss_mel = F.l1_loss(y_mel[:, :, :T], y_hat_mel[:, :, :T]) * hps.train.c_mel
 
         loss_dur = torch.sum(l_length.float())
-        loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
+        loss_kl = compute_kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
 
         loss_fm = feature_loss(fmap_r, fmap_g)
         loss_gen, losses_gen = generator_loss(y_d_hat_g)
         
-        with torch._dynamo.disable():
-          if global_step % hps.train.subband_interval == 0:
-            if hps.model.mb_istft_vits == True:
-              pqmf = PQMF(y.device)
-              y_mb = pqmf.analysis(y)
-              loss_subband = subband_stft_loss(hps, y_mb, y_hat_mb)
-            else:
-              loss_subband = torch.tensor(0.0)
-          else:
-            loss_subband = torch.zeros_like(loss_mel)
+        if hps.model.mb_istft_vits == True:
+          loss_subband = compute_subband_loss(hps, y, y_hat_mb)
+        else:
+          loss_subband = torch.tensor(0.0)
 
         T = min(f0_pred.size(2), f0_gt.size(2))
         loss_f0 = F.l1_loss(f0_pred[:, :, :T] * z_mask[:, :, :T], f0_gt[:, :, :T] * z_mask[:, :, :T]) * hps.train.c_f0
         loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl + loss_subband + loss_f0
 
-    optim_g.zero_grad()
+    # optim_g.zero_grad()
+    for param in optim_g.parameters():
+      param.grad = None
+
     scaler.scale(loss_gen_all).backward()
     scaler.unscale_(optim_g)
     grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
@@ -278,15 +287,18 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
         evaluate(hps, net_g, eval_loader, writer_eval)
         utils.save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch, os.path.join(hps.model_dir, "G_{}.pth".format(global_step)))
         utils.save_checkpoint(net_d, optim_d, hps.train.learning_rate, epoch, os.path.join(hps.model_dir, "D_{}.pth".format(global_step)))
-    global_step += 1
-  
+    
+    lobal_step += 1
+    torch.cuda.empty_cache()
+
   if rank == 0:
     logger.info('====> Epoch: {}'.format(epoch))
 
     
 def evaluate(hps, generator, eval_loader, writer_eval):
     generator.eval()
-    with torch.no_grad():
+    # torch.no_grad() -> torch.inference_mode()
+    with torch.inference_mode():
       for batch_idx, (x, x_lengths, spec, spec_lengths, y, y_lengths, f0_gt) in enumerate(eval_loader):
         x, x_lengths = x.cuda(0), x_lengths.cuda(0)
         spec, spec_lengths = spec.cuda(0), spec_lengths.cuda(0)
@@ -339,7 +351,5 @@ def evaluate(hps, generator, eval_loader, writer_eval):
 
                            
 if __name__ == "__main__":
-  os.environ[
-        "TORCH_DISTRIBUTED_DEBUG"
-    ] = "DETAIL"
+  os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
   main()
