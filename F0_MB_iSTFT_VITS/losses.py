@@ -2,6 +2,7 @@ import torch
 from stft_loss import MultiResolutionSTFTLoss
 
 
+@torch.jit.script # もしかしたら高速化するかもしれないので付けとく
 def feature_loss(fmap_r, fmap_g):
   loss = 0
   for dr, dg in zip(fmap_r, fmap_g):
@@ -13,6 +14,7 @@ def feature_loss(fmap_r, fmap_g):
   return loss * 2 
 
 
+@torch.jit.script # もしかしたら高速化するかもしれないので付けとく
 def discriminator_loss(disc_real_outputs, disc_generated_outputs):
   loss = 0
   r_losses = []
@@ -26,23 +28,22 @@ def discriminator_loss(disc_real_outputs, disc_generated_outputs):
     loss += (r_loss + g_loss)
     r_losses.append(r_loss.item())
     g_losses.append(g_loss.item())
-
   return loss, r_losses, g_losses
 
 
+@torch.jit.script # もしかしたら高速化するかもしれないので付けとく
 def generator_loss(disc_outputs):
   loss = 0
   gen_losses = []
-  
   for dg in disc_outputs:
     dg = dg.float()
     l = torch.mean((1-dg)**2)
     gen_losses.append(l)
     loss += l
-
   return loss, gen_losses
 
 
+@torch.jit.script # もしかしたら高速化するかもしれないので付けとく
 def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
   """
   z_p, logs_q: [b, h, t_t]
@@ -59,6 +60,7 @@ def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
   kl = torch.sum(kl * z_mask)
   l = kl / torch.sum(z_mask)
   return l
+
 
 def subband_stft_loss(h, y_mb, y_hat_mb):
   sub_stft_loss = MultiResolutionSTFTLoss(h.train.fft_sizes, h.train.hop_sizes, h.train.win_lengths)
