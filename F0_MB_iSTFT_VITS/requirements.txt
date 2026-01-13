@@ -12,6 +12,8 @@ matplotlib==3.9.0
 numpy
 phonemizer
 scipy==1.10.0
+loguru
 tensorboard
 Unidecode
 soundcard
+safetensors
